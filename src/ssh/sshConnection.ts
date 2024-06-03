@@ -2,10 +2,10 @@
 
 import { EventEmitter } from 'events';
 import * as net from 'net';
+import { Server } from 'net';
 import * as fs from 'fs';
 import * as stream from 'stream';
 import { Client, ClientChannel, ClientErrorExtensions, ExecOptions, ShellOptions, ConnectConfig } from 'ssh2';
-import { Server } from 'net';
 import { SocksConnectionInfo, createServer as createSocksServer } from 'simple-socks';
 
 export interface SSHConnectConfig extends ConnectConfig {
@@ -114,7 +114,7 @@ export default class SSHConnection extends EventEmitter {
             });
         });
     }
-    
+
     /**
      * Exec a command
      */
@@ -135,18 +135,18 @@ export default class SSHConnection extends EventEmitter {
                         }
                     }).on('data', function (data: Buffer | string) {
                         stdout += data.toString();
-                        
+
                         if (tester(stdout, stderr)) {
                             resolved = true;
-                            
+
                             return resolve({ stdout, stderr });
                         }
                     }).stderr.on('data', function (data: Buffer | string) {
                         stderr += data.toString();
-                        
+
                         if (tester(stdout, stderr)) {
                             resolved = true;
-                        
+
                             return resolve({ stdout, stderr });
                         }
                     });

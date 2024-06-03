@@ -57,6 +57,7 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
 
     private socksTunnel: SSHTunnelConfig | undefined;
     private tunnels: TunnelInfo[] = [];
+    private isDev: boolean
 
     private labelFormatterDisposable: vscode.Disposable | undefined;
 
@@ -64,6 +65,7 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
         readonly context: vscode.ExtensionContext,
         readonly logger: Log
     ) {
+        this.isDev = context.isDevelopment;
     }
 
     resolve(authority: string, context: vscode.RemoteAuthorityResolverContext): Thenable<vscode.ResolverResult> {
@@ -81,7 +83,6 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
         const remoteSSHconfig = vscode.workspace.getConfiguration('remote.SSH');
         const enableDynamicForwarding = remoteSSHconfig.get<boolean>('enableDynamicForwarding', true)!;
         const enableAgentForwarding = remoteSSHconfig.get<boolean>('enableAgentForwarding', true)!;
-        const serverDownloadUrlTemplate = remoteSSHconfig.get<string>('serverDownloadUrlTemplate');
         const defaultExtensions = remoteSSHconfig.get<string[]>('defaultExtensions', []);
         const remotePlatformMap = remoteSSHconfig.get<Record<string, string>>('remotePlatform', {});
         const remoteServerListenOnSocket = remoteSSHconfig.get<boolean>('remoteServerListenOnSocket', false)!;
@@ -96,8 +97,8 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                 const sshconfig = await SSHConfiguration.loadFromFS();
                 const sshHostConfig = sshconfig.getHostConfiguration(sshDest.hostname);
                 const sshHostName = sshHostConfig['HostName'] ? sshHostConfig['HostName'].replace('%h', sshDest.hostname) : sshDest.hostname;
-                const sshUser = sshHostConfig['User'] || sshDest.user || os.userInfo().username || ''; // https://github.com/openssh/openssh-portable/blob/5ec5504f1d328d5bfa64280cd617c3efec4f78f3/sshconnect.c#L1561-L1562
-                const sshPort = sshHostConfig['Port'] ? parseInt(sshHostConfig['Port'], 10) : (sshDest.port || 22);
+                const sshUser = sshHostConfig['User'] || sshDest.user || os.userInfo().username || ''; // https://cursor.blob.core.windows.net/remote-releases/0.33.1-26d69e8cd372a090b6a05b74a32fa7f9d52c10b0/vscode-reh-linux-x64.tar.gz
+                const sshPort = sshHostConfig['Port'] ? parseInt(sshHostConfig['Port'], 10) : 22;
 
                 this.sshAgentSock = sshHostConfig['IdentityAgent'] || process.env['SSH_AUTH_SOCK'] || (isWindows ? '\\\\.\\pipe\\openssh-ssh-agent' : undefined);
                 this.sshAgentSock = this.sshAgentSock ? untildify(this.sshAgentSock) : undefined;
@@ -152,20 +153,13 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                         proxyStream = await proxyConnection.forwardOut('127.0.0.1', 0, destIP, destPort);
                     }
                 } else if (sshHostConfig['ProxyCommand']) {
-                    let proxyArgs = (sshHostConfig['ProxyCommand'] as unknown as string[])
+                    const proxyArgs = (sshHostConfig['ProxyCommand'] as unknown as string[])
                         .map((arg) => arg.replace('%h', sshHostName).replace('%p', sshPort.toString()).replace('%r', sshUser));
-                    let proxyCommand = proxyArgs.shift()!;
-
-                    let options = {};
-                    if (isWindows && /\.(bat|cmd)$/.test(proxyCommand)) {
-                        proxyCommand = `"${proxyCommand}"`;
-                        proxyArgs = proxyArgs.map((arg) => arg.includes(' ') ? `"${arg}"` : arg);
-                        options = { shell: true, windowsHide: true, windowsVerbatimArguments: true };
-                    }
+                    const proxyCommand = proxyArgs.shift()!;
 
                     this.logger.trace(`Spawning ProxyCommand: ${proxyCommand} ${proxyArgs.join(' ')}`);
 
-                    const child = cp.spawn(proxyCommand, proxyArgs, options);
+                    const child = cp.spawn(proxyCommand, proxyArgs);
                     proxyStream = stream.Duplex.from({ readable: child.stdout, writable: child.stdin });
                     this.proxyCommandProcess = child;
                 }
@@ -182,28 +176,22 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                     strictVendor: false,
                     agentForward,
                     agent,
-                    authHandler: (arg0, arg1, arg2) => (sshAuthHandler(arg0, arg1, arg2), undefined),
+                    authHandler: (arg0, arg1, arg2) => (sshAuthHandler(arg0, arg1, arg2), undefined)
                 });
                 await this.sshConnection.connect();
 
-                const envVariables: Record<string, string | null> = {};
+                const envVariables = [];
                 if (agentForward) {
-                    envVariables['SSH_AUTH_SOCK'] = null;
+                    envVariables.push('SSH_AUTH_SOCK');
                 }
 
-                const installResult = await installCodeServer(this.sshConnection, serverDownloadUrlTemplate, defaultExtensions, Object.keys(envVariables), remotePlatformMap[sshDest.hostname], remoteServerListenOnSocket, this.logger);
-
-                for (const key of Object.keys(envVariables)) {
-                    if (installResult[key] !== undefined) {
-                        envVariables[key] = installResult[key];
-                    }
-                }
+                const installResult = await installCodeServer(this.sshConnection, defaultExtensions, envVariables, remotePlatformMap[sshDest.hostname], remoteServerListenOnSocket, this.logger, this.isDev);
 
                 // Update terminal env variables
                 this.context.environmentVariableCollection.persistent = false;
-                for (const [key, value] of Object.entries(envVariables)) {
-                    if (value) {
-                        this.context.environmentVariableCollection.replace(key, value);
+                for (const envVar of envVariables) {
+                    if (installResult[envVar] !== undefined) {
+                        this.context.environmentVariableCollection.replace(envVar, installResult[envVar]);
                     }
                 }
 
@@ -230,13 +218,11 @@ export class RemoteSSHResolver implements vscode.RemoteAuthorityResolver, vscode
                         label: '${path}',
                         separator: '/',
                         tildify: true,
-                        workspaceSuffix: `SSH: ${sshDest.hostname}` + (sshDest.port && sshDest.port !== 22 ? `:${sshDest.port}` : '')
+                        workspaceSuffix: `SSH: ${sshDest.hostname}`
                     }
                 });
 
-                const resolvedResult: vscode.ResolverResult = new vscode.ResolvedAuthority('127.0.0.1', tunnelConfig.localPort, installResult.connectionToken);
-                resolvedResult.extensionHostEnv = envVariables;
-                return resolvedResult;
+                return new vscode.ResolvedAuthority('127.0.0.1', tunnelConfig.localPort, installResult.connectionToken);
             } catch (e: unknown) {
                 this.logger.error(`Error resolving authority`, e);
 

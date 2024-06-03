@@ -1,22 +1,3 @@
-## 0.0.45
-- Use windows-x64 server on windows-arm64
-
-## 0.0.44
-- Update ssh2 lib
-- Properly set extensionHost env variables
-
-## 0.0.43
-- Fix parsing multiple include directives
-
-## 0.0.42
-- Fix remote label to show port when connecting to a port other than 22
-
-## 0.0.41
-- Take into account parsed port from ssh destination. Fixes (#110)
-
-## 0.0.40
-- Update ssh-config package
-
 ## 0.0.39
 
 - output error messages when downloading vscode server (#39)

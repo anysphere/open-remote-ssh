@@ -1,11 +1,19 @@
 import * as os from 'os';
 import * as fs from 'fs';
 import * as path from 'path';
-import SSHConfig, { Directive, Line, Section } from '@jeanp413/ssh-config';
+import SSHConfig, { Directive, Line, Section } from 'ssh-config';
+// THe GODDAMN DEFAULT IMPORT ISSUE
+// NEED TO MAKE IT AN ESLINT RULE!!
+import * as SSHConfigParent from 'ssh-config';
 import * as vscode from 'vscode';
 import { exists as fileExists, normalizeToSlash, untildify } from '../common/files';
 import { isWindows } from '../common/platform';
 import { glob } from 'glob';
+
+// We have to do this ugly stuff for now with default imports
+// TODO - figure it out
+// @ts-ignore
+const SSHConfig2: typeof SSHConfig = SSHConfigParent;
 
 const systemSSHConfig = isWindows ? path.resolve(process.env.ALLUSERSPROFILE || 'C:\\ProgramData', 'ssh\\ssh_config') : '/etc/ssh/ssh_config';
 const defaultSSHConfigPath = path.resolve(os.homedir(), '.ssh/config');
@@ -16,7 +24,7 @@ export function getSSHConfigPath() {
 }
 
 function isDirective(line: Line): line is Directive {
-    return line.type === SSHConfig.DIRECTIVE;
+    return line.type === SSHConfig2.DIRECTIVE;
 }
 
 function isHostSection(line: Line): line is Section {
@@ -63,28 +71,30 @@ async function parseSSHConfigFromFile(filePath: string, userConfig: boolean) {
     if (await fileExists(filePath)) {
         content = (await fs.promises.readFile(filePath, 'utf8')).trim();
     }
-    const config = normalizeSSHConfig(SSHConfig.parse(content));
+    const config = normalizeSSHConfig(SSHConfig2.parse(content));
 
-    const includedConfigs: [number, SSHConfig[]][] = [];
+    const includedConfigs = new Map<number, SSHConfig>();
     for (let i = 0; i < config.length; i++) {
         const line = config[i];
         if (isIncludeDirective(line)) {
-            const values = (line.value as string).split(',').map(s => s.trim());
-            const configs: SSHConfig[] = [];
-            for (const value of values) {
-                const includePaths = await glob(normalizeToSlash(untildify(value)), {
-                    absolute: true,
-                    cwd: normalizeToSlash(path.dirname(userConfig ? defaultSSHConfigPath : systemSSHConfig))
-                });
-                for (const p of includePaths) {
-                    configs.push(await parseSSHConfigFromFile(p, userConfig));
+            const includePaths = await new Promise<string[]>((resolve, reject) => glob(
+                normalizeToSlash(untildify(line.value)), {
+                absolute: true,
+                cwd: normalizeToSlash(path.dirname(userConfig ? defaultSSHConfigPath : systemSSHConfig))
+            }, (err, matches) => {
+                if (err !== null) {
+                    reject(err);
+                } else {
+                    resolve(matches);
                 }
+            }));
+            for (const p of includePaths) {
+                includedConfigs.set(i, await parseSSHConfigFromFile(p, userConfig));
             }
-            includedConfigs.push([i, configs]);
         }
     }
-    for (const [idx, includeConfigs] of includedConfigs.reverse()) {
-        config.splice(idx, 1, ...includeConfigs.flat());
+    for (const [idx, includeConfig] of includedConfigs.entries()) {
+        config.splice(idx, 1, ...includeConfig);
     }
 
     return config;
@@ -106,7 +116,7 @@ export default class SSHConfiguration {
         const hosts = new Set<string>();
         for (const line of this.sshConfig) {
             if (isHostSection(line)) {
-                const value = Array.isArray(line.value) ? line.value[0] : line.value;
+                const value = Array.isArray(line.value as string[] | string) ? line.value[0] : line.value;
                 const isPattern = /^!/.test(value) || /[?*]/.test(value);
                 if (!isPattern) {
                     hosts.add(value);
@@ -118,8 +128,6 @@ export default class SSHConfiguration {
     }
 
     getHostConfiguration(host: string): Record<string, string> {
-        // Only a few directives return an array
-        // https://github.com/jeanp413/ssh-config/blob/8d187bb8f1d83a51ff2b1d127e6b6269d24092b5/src/ssh-config.ts#L9C1-L9C118
-        return this.sshConfig.compute(host) as Record<string, string>;
+        return this.sshConfig.compute(host);
     }
 }

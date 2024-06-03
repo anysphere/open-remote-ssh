@@ -2,14 +2,14 @@
 	"name": "open-remote-ssh",
 	"displayName": "Open Remote - SSH",
 	"description": "Use any remote machine with a SSH server as your development environment.",
-	"version": "0.0.45",
-	"publisher": "jeanp413",
+	"version": "0.0.39",
+	"publisher": "Anysphere",
 	"repository": {
 		"type": "git",
-		"url": "https://github.com/jeanp413/open-remote-ssh.git"
+		"url": "https://github.com/anysphere/open-remote-ssh.git"
 	},
 	"bugs": {
-		"url": "https://github.com/jeanp413/open-remote-ssh/issues"
+		"url": "https://github.com/anysphere/open-remote-ssh/issues"
 	},
 	"icon": "resources/icon.png",
 	"engines": {
@@ -20,7 +20,8 @@
 	],
 	"enabledApiProposals": [
 		"resolvers",
-		"contribViewsRemote"
+		"contribViewsRemote",
+		"cursor"
 	],
 	"keywords": [
 		"remote development",
@@ -29,14 +30,9 @@
 	],
 	"api": "none",
 	"activationEvents": [
-		"onCommand:openremotessh.openEmptyWindow",
-		"onCommand:openremotessh.openEmptyWindowInCurrentWindow",
-		"onCommand:openremotessh.openConfigFile",
-		"onCommand:openremotessh.showLog",
-		"onResolveRemoteAuthority:ssh-remote",
-		"onView:sshHosts"
+		"onResolveRemoteAuthority:ssh-remote"
 	],
-	"main": "./out/extension.js",
+	"main": "./out/main.js",
 	"contributes": {
 		"configuration": {
 			"title": "Remote - SSH",
@@ -74,12 +70,6 @@
 					"scope": "application",
 					"default": true
 				},
-				"remote.SSH.serverDownloadUrlTemplate": {
-					"type": "string",
-					"description": "The URL from where the vscode server will be downloaded. You can use the following variables and they will be replaced dynamically:\n- ${quality}: vscode server quality, e.g. stable or insiders\n- ${version}: vscode server version, e.g. 1.69.0\n- ${commit}: vscode server release commit\n- ${arch}: vscode server arch, e.g. x64, armhf, arm64\n- ${release}: release number, vscodium only https://github.com/VSCodium/vscodium/pull/1192",
-					"scope": "application",
-					"default": "https://github.com/VSCodium/vscodium/releases/download/${version}.${release}/vscodium-reh-${os}-${arch}-${version}.${release}.tar.gz"
-				},
 				"remote.SSH.remotePlatform": {
 					"type": "object",
 					"description": "A map of the remote hostname to the platform for that remote. Valid values: linux, macos, windows.",
@@ -98,12 +88,6 @@
 					"type": "boolean",
 					"description": "When true, the remote vscode server will listen on a socket path instead of opening a port. Only valid for Linux and macOS remotes. Requires `AllowStreamLocalForwarding` to be enabled for the SSH server.",
 					"default": false
-				},
-				"remote.SSH.experimental.serverBinaryName": {
-					"type": "string",
-					"description": "**Experimental:** The name of the server binary, use this **only if** you are using a client without a corresponding server release",
-					"scope": "application",
-					"default": ""
 				}
 			}
 		},
@@ -338,32 +322,33 @@
 		}
 	},
 	"scripts": {
-		"postinstall": "yarn update-dts",
-		"vscode:prepublish": "webpack --mode production",
-		"webpack": "webpack --mode development",
-		"compile": "tsc -b",
-		"watch": "tsc -b -w",
-		"package": "npx vsce package --yarn",
-		"update-dts": "npx vscode-dts dev && npx vscode-dts main"
+		"compile": "npx gulp compile-extension:open-remote-ssh",
+		"watch": "npx gulp watch-extension:open-remote-ssh",
+		"buf:generate": "buf generate ../../../schema && yarn buf:fixwebpack",
+		"buf:fixwebpack": "find src/proto -type f -exec sed -i.bak -E 's/(import|export) (.*) from \"(.*)\\.js\"/\\1 \\2 from \\x27\\3\\x27/g' {} \\; && find src/proto -name '*.bak' -delete"
 	},
 	"devDependencies": {
+		"@bufbuild/protoc-gen-connect-web": "^0.6.0",
+		"@bufbuild/protoc-gen-es": "^1.0.0",
 		"@types/node": "^16.11.0",
 		"@types/ssh2": "^0.5.52",
 		"@types/webpack": "^5.28.0",
 		"@typescript-eslint/eslint-plugin": "^5.19.0",
 		"@typescript-eslint/parser": "^5.19.0",
-		"eslint": "^8.13.0",
-		"eslint-plugin-jsdoc": "^19.1.0",
 		"ts-loader": "^9.2.7",
 		"typescript": "^4.6.3",
 		"webpack": "^5.42.0",
 		"webpack-cli": "^4.7.2"
 	},
 	"dependencies": {
-		"glob": "^9.3.1",
+		"@bufbuild/connect-node": "^0.8.4",
+		"@bufbuild/connect-web": "^0.8.4",
+		"@bufbuild/protobuf": "^1.0.0",
+		"@connectrpc/connect": "^1.4.0",
+		"node-fetch": "2.6.7",
 		"simple-socks": "git+https://github.com/jeanp413/simple-socks#main",
 		"socks": "^2.5.0",
-		"@jeanp413/ssh-config": "^4.3.1",
+		"ssh-config": "^4.0.4",
 		"ssh2": "git+https://github.com/jeanp413/ssh2#master"
 	}
 }

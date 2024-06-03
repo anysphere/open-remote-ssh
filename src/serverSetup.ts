@@ -1,4 +1,6 @@
+import * as vscode from 'vscode';
 import * as crypto from 'crypto';
+import * as fs from 'fs';
 import Log from './common/logger';
 import { getVSCodeServerConfig } from './serverConfig';
 import SSHConnection from './ssh/sshConnection';
@@ -8,13 +10,13 @@ export interface ServerInstallOptions {
     quality: string;
     commit: string;
     version: string;
-    release?: string; // vscodium specific
     extensionIds: string[];
     envVariables: string[];
     useSocketPath: boolean;
     serverApplicationName: string;
     serverDataFolderName: string;
     serverDownloadUrlTemplate: string;
+    platform?: string;
 }
 
 export interface ServerInstallResult {
@@ -35,10 +37,34 @@ export class ServerInstallError extends Error {
     }
 }
 
-const DEFAULT_DOWNLOAD_URL_TEMPLATE = 'https://github.com/VSCodium/vscodium/releases/download/${version}.${release}/vscodium-reh-${os}-${arch}-${version}.${release}.tar.gz';
+// TODO: we need to clean up the cursor-servers that we download to the remote machine
 
-export async function installCodeServer(conn: SSHConnection, serverDownloadUrlTemplate: string | undefined, extensionIds: string[], envVariables: string[], platform: string | undefined, useSocketPath: boolean, logger: Log): Promise<ServerInstallResult> {
+// we include the commit in the download template
+// this means that remote SSH won't work in debug mode, which is unfortunate but OK
+// the reason we remove the commit is that otherwise we have a big problem:
+// we often create multiple builds with the same version, because that's how we build and test things on todesktop
+// if we don't include the commit, then there is no way to uniquely identify which server release is the right one, since we will have uploaded many of them
+// it is possible that we want to default back onto a non-commit-based host just to make this work for debug, but that doesn't feel worth it to me
+// this should match the build/azure-pipelines/linux/product-build-linux-reh.yml file
+const DEFAULT_DOWNLOAD_URL_TEMPLATE = "https://cursor.blob.core.windows.net/remote-releases/${version}-${commit}/vscode-reh-${os}-${arch}.tar.gz"
+
+export async function installCodeServer(
+    conn: SSHConnection,
+    extensionIds: string[],
+    envVariables: string[],
+    platform: string | undefined,
+    useSocketPath: boolean,
+    logger: Log,
+    isDev: boolean
+): Promise<ServerInstallResult> {
     let shell = 'powershell';
+
+    if (platform !== undefined && platform !== 'linux') {
+        vscode.cursor.publicLogCapture(`ssh/unsupportedPlatform/${platform}`)
+        await vscode.window.showErrorMessage(`Cursor SSH does not support ${platform} yet. If this is blocking you from using Cursor, please email us at hi@cursor.so and we will implement support for this for you!`, { modal: true });
+    } else {
+        vscode.cursor.publicLogCapture(`ssh/supportedPlatform/${platform}`)
+    }
 
     // detect plaform and shell for windows
     if (!platform || platform === 'windows') {
@@ -68,20 +94,22 @@ export async function installCodeServer(conn: SSHConnection, serverDownloadUrlTe
     }
 
     const scriptId = crypto.randomBytes(12).toString('hex');
+    console.log('getting server config')
 
     const vscodeServerConfig = await getVSCodeServerConfig();
+    console.log('got server config', vscodeServerConfig)
     const installOptions: ServerInstallOptions = {
         id: scriptId,
-        version: vscodeServerConfig.version,
-        commit: vscodeServerConfig.commit,
-        quality: vscodeServerConfig.quality,
-        release: vscodeServerConfig.release,
+        version: isDev ? '0.33.1' : vscodeServerConfig.version,
+        commit: isDev ? '26d69e8cd372a090b6a05b74a32fa7f9d52c10b0' : vscodeServerConfig.commit,
+        quality: isDev ? 'remote-releases' : vscodeServerConfig.quality,
         extensionIds,
         envVariables,
         useSocketPath,
         serverApplicationName: vscodeServerConfig.serverApplicationName,
         serverDataFolderName: vscodeServerConfig.serverDataFolderName,
-        serverDownloadUrlTemplate: serverDownloadUrlTemplate ?? vscodeServerConfig.serverDownloadUrlTemplate ?? DEFAULT_DOWNLOAD_URL_TEMPLATE,
+        serverDownloadUrlTemplate: DEFAULT_DOWNLOAD_URL_TEMPLATE,
+        platform,
     };
 
     let commandOutput: { stdout: string; stderr: string };
@@ -135,7 +163,8 @@ export async function installCodeServer(conn: SSHConnection, serverDownloadUrlTe
         logger.trace('Server install command:', installServerScript);
         // Fish shell does not support heredoc so let's workaround it using -c option,
         // also replace single quotes (') within the script with ('\'') as there's no quoting within single quotes, see https://unix.stackexchange.com/a/24676
-        commandOutput = await conn.exec(`bash -c '${installServerScript.replace(/'/g, `'\\''`)}'`);
+        const base64Script = Buffer.from(installServerScript).toString('base64');
+        commandOutput = await conn.exec(`echo ${base64Script} | base64 --decode | bash`);
     }
 
     if (commandOutput.stderr) {
@@ -198,7 +227,7 @@ function parseServerInstallOutput(str: string, scriptId: string): { [k: string]:
     return resultMap;
 }
 
-function generateBashInstallScript({ id, quality, version, commit, release, extensionIds, envVariables, useSocketPath, serverApplicationName, serverDataFolderName, serverDownloadUrlTemplate }: ServerInstallOptions) {
+function generateBashInstallScript({ id, quality, version, commit, extensionIds, envVariables, useSocketPath, serverApplicationName, serverDataFolderName, serverDownloadUrlTemplate, platform }: ServerInstallOptions) {
     const extensions = extensionIds.map(id => '--install-extension ' + id).join(' ');
     return `
 # Server installation script
@@ -208,17 +237,17 @@ TMP_DIR="\${XDG_RUNTIME_DIR:-"/tmp"}"
 DISTRO_VERSION="${version}"
 DISTRO_COMMIT="${commit}"
 DISTRO_QUALITY="${quality}"
-DISTRO_VSCODIUM_RELEASE="${release ?? ''}"
 
 SERVER_APP_NAME="${serverApplicationName}"
 SERVER_INITIAL_EXTENSIONS="${extensions}"
 SERVER_LISTEN_FLAG="${useSocketPath ? `--socket-path="$TMP_DIR/vscode-server-sock-${crypto.randomUUID()}"` : '--port=0'}"
 SERVER_DATA_DIR="$HOME/${serverDataFolderName}"
-SERVER_DIR="$SERVER_DATA_DIR/bin/$DISTRO_COMMIT"
+SERVER_DIR="$SERVER_DATA_DIR/bin/$DISTRO_VERSION-$DISTRO_COMMIT"
 SERVER_SCRIPT="$SERVER_DIR/bin/$SERVER_APP_NAME"
 SERVER_LOGFILE="$SERVER_DATA_DIR/.$DISTRO_COMMIT.log"
 SERVER_PIDFILE="$SERVER_DATA_DIR/.$DISTRO_COMMIT.pid"
 SERVER_TOKENFILE="$SERVER_DATA_DIR/.$DISTRO_COMMIT.token"
+SERVER_OS=
 SERVER_ARCH=
 SERVER_CONNECTION_TOKEN=
 SERVER_DOWNLOAD_URL=
@@ -245,22 +274,22 @@ print_install_results_and_exit() {
 }
 
 # Check if platform is supported
-KERNEL="$(uname -s)"
-case $KERNEL in
+PLATFORM="$(uname -s)"
+case $PLATFORM in
     Darwin)
-        PLATFORM="darwin"
+        SERVER_OS="darwin"
         ;;
     Linux)
-        PLATFORM="linux"
+        SERVER_OS="linux"
         ;;
     FreeBSD)
-        PLATFORM="freebsd"
+        SERVER_OS="freebsd"
         ;;
     DragonFly)
-        PLATFORM="dragonfly"
+        SERVER_OS="dragonfly"
         ;;
     *)
-        echo "Error platform not supported: $KERNEL"
+        echo "Error platform not supported: $PLATFORM"
         print_install_results_and_exit 1
         ;;
 esac
@@ -299,26 +328,35 @@ fi
 if [[ ! -d $SERVER_DIR ]]; then
     mkdir -p $SERVER_DIR
     if (( $? > 0 )); then
-        echo "Error creating server install directory"
-        print_install_results_and_exit 1
+        rm -rf $SERVER_DATA_DIR
+        mkdir -p $SERVER_DIR
+        if [[ $? != 0 ]]; then
+            echo "Error creating server install directory"
+            print_install_results_and_exit 1
+        fi
     fi
 fi
 
-SERVER_DOWNLOAD_URL="$(echo "${serverDownloadUrlTemplate.replace(/\$\{/g, '\\${')}" | sed "s/\\\${quality}/$DISTRO_QUALITY/g" | sed "s/\\\${version}/$DISTRO_VERSION/g" | sed "s/\\\${commit}/$DISTRO_COMMIT/g" | sed "s/\\\${os}/$PLATFORM/g" | sed "s/\\\${arch}/$SERVER_ARCH/g" | sed "s/\\\${release}/$DISTRO_VSCODIUM_RELEASE/g")"
+SERVER_DOWNLOAD_URL="$(echo "${serverDownloadUrlTemplate.replace(/\$\{/g, '\\${')}" | sed "s/\\\${quality}/$DISTRO_QUALITY/g" | sed "s/\\\${version}/$DISTRO_VERSION/g" | sed "s/\\\${commit}/$DISTRO_COMMIT/g" | sed "s/\\\${os}/$SERVER_OS/g" | sed "s/\\\${arch}/$SERVER_ARCH/g")"
+
+echo "Downloading server from '$SERVER_DOWNLOAD_URL'"
 
 # Check if server script is already installed
 if [[ ! -f $SERVER_SCRIPT ]]; then
-    if [[ "$PLATFORM" != "darwin" ]] && [[ "$PLATFORM" != "linux" ]]; then
-        echo "Error "$PLATFORM" needs manual installation of remote extension host"
+    if [[ "$SERVER_OS" = "dragonfly" ]] || [[ "$SERVER_OS" = "freebsd" ]]; then
+        echo "Error "$SERVER_OS" needs manual installation of remote extension host"
         print_install_results_and_exit 1
     fi
 
     pushd $SERVER_DIR > /dev/null
 
+    # Generate a random filename to avoid collisions
+    RANDOM_FILENAME="vscode-server-${crypto.randomUUID()}.tar.gz"
+
     if [[ ! -z $(which wget) ]]; then
-        wget --tries=3 --timeout=10 --continue --no-verbose -O vscode-server.tar.gz $SERVER_DOWNLOAD_URL
+        wget --tries=3 --timeout=10 --continue --no-verbose -O $RANDOM_FILENAME $SERVER_DOWNLOAD_URL
     elif [[ ! -z $(which curl) ]]; then
-        curl --retry 3 --connect-timeout 10 --location --show-error --silent --output vscode-server.tar.gz $SERVER_DOWNLOAD_URL
+        curl --retry 3 --connect-timeout 10 --location --show-error --silent --output $RANDOM_FILENAME $SERVER_DOWNLOAD_URL
     else
         echo "Error no tool to download server binary"
         print_install_results_and_exit 1
@@ -329,7 +367,7 @@ if [[ ! -f $SERVER_SCRIPT ]]; then
         print_install_results_and_exit 1
     fi
 
-    tar -xf vscode-server.tar.gz --strip-components 1
+    tar -xf $RANDOM_FILENAME --strip-components 1
     if (( $? > 0 )); then
         echo "Error while extracting server contents"
         print_install_results_and_exit 1
@@ -340,7 +378,7 @@ if [[ ! -f $SERVER_SCRIPT ]]; then
         print_install_results_and_exit 1
     fi
 
-    rm -f vscode-server.tar.gz
+    rm -f $RANDOM_FILENAME
 
     popd > /dev/null
 else
@@ -350,11 +388,17 @@ fi
 # Try to find if server is already running
 if [[ -f $SERVER_PIDFILE ]]; then
     SERVER_PID="$(cat $SERVER_PIDFILE)"
+    echo "Server PID: $SERVER_PID"
+    echo "Server script: $SERVER_SCRIPT"
     SERVER_RUNNING_PROCESS="$(ps -o pid,args -p $SERVER_PID | grep $SERVER_SCRIPT)"
 else
+    echo "Server script: $SERVER_SCRIPT"
     SERVER_RUNNING_PROCESS="$(ps -o pid,args -A | grep $SERVER_SCRIPT | grep -v grep)"
 fi
 
+echo "Server running process: $SERVER_RUNNING_PROCESS"
+
+SERVER_IS_RUNNING=$([[ ! -z $SERVER_RUNNING_PROCESS ]] && echo true || echo false)
 if [[ -z $SERVER_RUNNING_PROCESS ]]; then
     if [[ -f $SERVER_LOGFILE ]]; then
         rm $SERVER_LOGFILE
@@ -374,37 +418,76 @@ else
     echo "Server script is already running $SERVER_SCRIPT"
 fi
 
-if [[ -f $SERVER_TOKENFILE ]]; then
-    SERVER_CONNECTION_TOKEN="$(cat $SERVER_TOKENFILE)"
-else
-    echo "Error server token file not found $SERVER_TOKENFILE"
-    print_install_results_and_exit 1
-fi
+function try_running() {
+    if [[ -f $SERVER_TOKENFILE ]]; then
+        SERVER_CONNECTION_TOKEN="$(cat $SERVER_TOKENFILE)"
 
-if [[ -f $SERVER_LOGFILE ]]; then
-    for i in {1..5}; do
-        LISTENING_ON="$(cat $SERVER_LOGFILE | grep -E 'Extension host agent listening on .+' | sed 's/Extension host agent listening on //')"
-        if [[ -n $LISTENING_ON ]]; then
-            break
-        fi
-        sleep 0.5
-    done
-
-    if [[ -z $LISTENING_ON ]]; then
-        echo "Error server did not start sucessfully"
-        print_install_results_and_exit 1
+    else
+        echo "Error server token file not found $SERVER_TOKENFILE"
+        return 1
     fi
-else
-    echo "Error server log file not found $SERVER_LOGFILE"
-    print_install_results_and_exit 1
-fi
+
+    if [[ -f $SERVER_PIDFILE ]]; then
+        SERVER_PID="$(cat $SERVER_PIDFILE)"
+        SERVER_RUNNING_PROCESS="$(ps -o pid,args -p $SERVER_PID | grep $SERVER_SCRIPT)"
+    else
+        SERVER_RUNNING_PROCESS="$(ps -o pid,args -A | grep $SERVER_SCRIPT | grep -v grep)"
+    fi
+    if [[ -f $SERVER_LOGFILE ]]; then
+        for i in {1..5}; do
+            LISTENING_ON="$(cat $SERVER_LOGFILE | grep -E 'Extension host agent listening on .+' | sed 's/Extension host agent listening on //')"
+            if [[ -n $LISTENING_ON ]]; then
+                break
+            fi
+            sleep 0.5
+        done
+
+        if [[ -z $LISTENING_ON ]]; then
+            echo "Error server did not start sucessfully"
+            return 1
+        fi
+    else
+        echo "Error server log file not found $SERVER_LOGFILE"
+        return 1
+    fi
+
+    return 0
+}
 
 # Finish server setup
+if ! try_running; then
+    echo "Failed once $SERVER_IS_RUNNING"
+    if [[ $SERVER_IS_RUNNING == true ]]; then
+        echo "Retry"
+        if [[ -f $SERVER_LOGFILE ]]; then
+            rm $SERVER_LOGFILE
+        fi
+        if [[ -f $SERVER_TOKENFILE ]]; then
+            rm $SERVER_TOKENFILE
+        fi
+
+        touch $SERVER_TOKENFILE
+        chmod 600 $SERVER_TOKENFILE
+        SERVER_CONNECTION_TOKEN="${crypto.randomUUID()}"
+        echo $SERVER_CONNECTION_TOKEN > $SERVER_TOKENFILE
+
+        $SERVER_SCRIPT --start-server --host=127.0.0.1 $SERVER_LISTEN_FLAG $SERVER_INITIAL_EXTENSIONS --connection-token-file $SERVER_TOKENFILE --telemetry-level off --enable-remote-auto-shutdown --accept-server-license-terms &> $SERVER_LOGFILE &
+        echo $! > $SERVER_PIDFILE
+        if ! try_running; then
+            echo "Exiting after retry"
+            print_install_results_and_exit 1
+        fi
+    else
+        echo "Exiting without"
+        print_install_results_and_exit 1
+    fi
+fi
+
 print_install_results_and_exit 0
 `;
 }
 
-function generatePowerShellInstallScript({ id, quality, version, commit, release, extensionIds, envVariables, useSocketPath, serverApplicationName, serverDataFolderName, serverDownloadUrlTemplate }: ServerInstallOptions) {
+function generatePowerShellInstallScript({ id, quality, version, serverDownloadUrlTemplate, commit, extensionIds, envVariables, useSocketPath, serverApplicationName, serverDataFolderName }: ServerInstallOptions) {
     const extensions = extensionIds.map(id => '--install-extension ' + id).join(' ');
     const downloadUrl = serverDownloadUrlTemplate
         .replace(/\$\{quality\}/g, quality)
@@ -412,7 +495,6 @@ function generatePowerShellInstallScript({ id, quality, version, commit, release
         .replace(/\$\{commit\}/g, commit)
         .replace(/\$\{os\}/g, 'win32')
         .replace(/\$\{arch\}/g, 'x64')
-        .replace(/\$\{release\}/g, release ?? '');
 
     return `
 # Server installation script
@@ -422,17 +504,17 @@ $TMP_DIR="$env:TEMP\\$([System.IO.Path]::GetRandomFileName())"
 $DISTRO_VERSION="${version}"
 $DISTRO_COMMIT="${commit}"
 $DISTRO_QUALITY="${quality}"
-$DISTRO_VSCODIUM_RELEASE="${release ?? ''}"
 
 $SERVER_APP_NAME="${serverApplicationName}"
 $SERVER_INITIAL_EXTENSIONS="${extensions}"
 $SERVER_LISTEN_FLAG="${useSocketPath ? `--socket-path="$TMP_DIR/vscode-server-sock-${crypto.randomUUID()}"` : '--port=0'}"
 $SERVER_DATA_DIR="$(Resolve-Path ~)\\${serverDataFolderName}"
-$SERVER_DIR="$SERVER_DATA_DIR\\bin\\$DISTRO_COMMIT"
+$SERVER_DIR="$SERVER_DATA_DIR\\bin\\$DISTRO_VERSION-$DISTRO_COMMIT"
 $SERVER_SCRIPT="$SERVER_DIR\\bin\\$SERVER_APP_NAME.cmd"
 $SERVER_LOGFILE="$SERVER_DATA_DIR\\.$DISTRO_COMMIT.log"
 $SERVER_PIDFILE="$SERVER_DATA_DIR\\.$DISTRO_COMMIT.pid"
 $SERVER_TOKENFILE="$SERVER_DATA_DIR\\.$DISTRO_COMMIT.token"
+$SERVER_OS="win32"
 $SERVER_ARCH=
 $SERVER_CONNECTION_TOKEN=
 $SERVER_DOWNLOAD_URL=
@@ -440,7 +522,6 @@ $SERVER_DOWNLOAD_URL=
 $LISTENING_ON=
 $OS_RELEASE_ID=
 $ARCH=
-$PLATFORM="win32"
 
 function printInstallResults($code) {
     "${id}: start"
@@ -450,7 +531,7 @@ function printInstallResults($code) {
     "logFile==$SERVER_LOGFILE=="
     "osReleaseId==$OS_RELEASE_ID=="
     "arch==$ARCH=="
-    "platform==$PLATFORM=="
+    "platform==windows=="
     "tmpDir==$TMP_DIR=="
     ${envVariables.map(envVar => `"${envVar}==$${envVar}=="`).join('\n')}
     "${id}: end"
@@ -458,8 +539,7 @@ function printInstallResults($code) {
 
 # Check machine architecture
 $ARCH=$env:PROCESSOR_ARCHITECTURE
-# Use x64 version for ARM64, as it's not yet available.
-if(($ARCH -eq "AMD64") -or ($ARCH -eq "IA64") -or ($ARCH -eq "ARM64")) {
+if(($ARCH -eq "AMD64") -or ($ARCH -eq "IA64")) {
     $SERVER_ARCH="x64"
 }
 else {
@@ -473,8 +553,13 @@ if(!(Test-Path $SERVER_DIR)) {
     try {
         ni -it d $SERVER_DIR -f -ea si
     } catch {
-        "Error creating server install directory - $($_.ToString())"
-        exit 1
+        try {
+            Remove-Item $SERVER_DATA_DIR -Force
+            ni -it d $SERVER_DIR -f -ea si
+        } catch {
+            "Error creating server install directory - $($_.ToString())"
+            exit 1
+        }
     }
 
     if(!(Test-Path $SERVER_DIR)) {
